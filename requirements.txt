@@ -3,3 +3,14 @@ numpy
 scikit-learn
 xgboost
 psycopg2-binary
+sqlalchemy
+kafka-python
+fastapi
+uvicorn
+python-dotenv
+boto3
+mlflow
+evidently
+jupyter
+matplotlib
+seaborn
