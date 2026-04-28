@@ -14,3 +14,4 @@ evidently
 jupyter
 matplotlib
 seaborn
+faker
