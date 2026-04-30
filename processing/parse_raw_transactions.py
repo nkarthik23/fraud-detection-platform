@@ -8,26 +8,82 @@ import pandas as pd
 INPUT_LOG_PATH = Path("data/raw/transactions.log")
 OUTPUT_PARQUET_PATH = Path("data/processed/transactions_clean.parquet")
 
-LINE_PATTERN = re.compile(
-    r'^(?P<timestamp>\S+)\s+\|\s+'
-    r'txn=(?P<transaction_id>[^|]+?)\s+\|\s+'
-    r'user=(?P<user_id>[^|]+?)\s+\|\s+'
-    r'amt=\$(?P<amount>[\d\.]+)\s+\|\s+'
-    r'merchant="(?P<merchant>[^"]+)"\s+\|\s+'
-    r'type=(?P<transaction_type>[^|]+?)\s+\|\s+'
-    r'oldbalanceOrg=(?P<oldbalanceOrg>[\d\.]+)\s+\|\s+'
-    r'newbalanceOrig=(?P<newbalanceOrig>[\d\.]+)\s+\|\s+'
-    r'oldbalanceDest=(?P<oldbalanceDest>[\d\.]+)\s+\|\s+'
-    r'newbalanceDest=(?P<newbalanceDest>[\d\.]+)\s+\|\s+'
-    r'isFraud=(?P<is_fraud>[01])$'
-)
+AMOUNT_PATTERN = re.compile(r"^\$?\s*([\d,]+(?:\.\d+)?)$|^USD\s+([\d,]+(?:\.\d+)?)$", re.IGNORECASE)
+BALANCE_NULL_TOKENS = {"", "null", "na", "none"}
 
 
 def parse_line(line: str) -> dict | None:
-    match = LINE_PATTERN.match(line.strip())
+    parts = [part.strip() for part in line.split("|")]
+    if len(parts) < 11:
+        return None
+
+    timestamp = parts[0]
+    kv: dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        kv[key.strip()] = value.strip()
+
+    required_keys = {
+        "txn",
+        "user",
+        "amt",
+        "merchant",
+        "type",
+        "oldbalanceOrg",
+        "newbalanceOrig",
+        "oldbalanceDest",
+        "newbalanceDest",
+        "isFraud",
+    }
+    if not required_keys.issubset(kv.keys()):
+        return None
+
+    merchant = kv["merchant"].strip().strip('"')
+    transaction_type = kv["type"].strip()
+    if not merchant:
+        merchant = "UNKNOWN"
+    if not transaction_type:
+        transaction_type = "UNKNOWN"
+
+    return {
+        "timestamp": timestamp,
+        "transaction_id": kv["txn"].strip(),
+        "user_id": kv["user"].strip(),
+        "amount": kv["amt"].strip(),
+        "merchant": merchant,
+        "transaction_type": transaction_type,
+        "oldbalanceOrg": kv["oldbalanceOrg"].strip(),
+        "newbalanceOrig": kv["newbalanceOrig"].strip(),
+        "oldbalanceDest": kv["oldbalanceDest"].strip(),
+        "newbalanceDest": kv["newbalanceDest"].strip(),
+        "is_fraud": kv["isFraud"].strip(),
+    }
+
+
+def parse_amount(value: str) -> float | None:
+    raw = value.strip()
+    match = AMOUNT_PATTERN.match(raw)
     if not match:
         return None
-    return match.groupdict()
+    numeric = match.group(1) or match.group(2)
+    if numeric is None:
+        return None
+    try:
+        return float(numeric.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_balance(value: str) -> float | None:
+    raw = value.strip().lower()
+    if raw in BALANCE_NULL_TOKENS:
+        return None
+    try:
+        return float(raw.replace(",", ""))
+    except ValueError:
+        return None
 
 
 def main() -> None:
@@ -54,32 +110,29 @@ def main() -> None:
 
     df = pd.DataFrame(parsed_records)
 
-    # Type conversions
+    # Robust type conversions
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df["oldbalanceOrg"] = pd.to_numeric(df["oldbalanceOrg"], errors="coerce")
-    df["newbalanceOrig"] = pd.to_numeric(df["newbalanceOrig"], errors="coerce")
-    df["oldbalanceDest"] = pd.to_numeric(df["oldbalanceDest"], errors="coerce")
-    df["newbalanceDest"] = pd.to_numeric(df["newbalanceDest"], errors="coerce")
-    df["is_fraud"] = pd.to_numeric(df["is_fraud"], errors="coerce").astype("Int64")
+    df["amount"] = df["amount"].apply(parse_amount)
+    df["oldbalanceOrg"] = df["oldbalanceOrg"].apply(parse_balance)
+    df["newbalanceOrig"] = df["newbalanceOrig"].apply(parse_balance)
+    df["oldbalanceDest"] = df["oldbalanceDest"].apply(parse_balance)
+    df["newbalanceDest"] = df["newbalanceDest"].apply(parse_balance)
+    df["is_fraud"] = pd.to_numeric(df["is_fraud"], errors="coerce")
 
     # Standardize transaction type
     df["transaction_type"] = df["transaction_type"].str.upper().str.strip()
 
-    # Drop rows with failed type conversions
-    before_type_drop = len(df)
+    # Drop rows with invalid timestamps
+    before_ts_drop = len(df)
+    df = df.dropna(subset=["timestamp"])
+    invalid_timestamps_dropped = before_ts_drop - len(df)
+
+    # Drop rows with invalid required numeric fields
+    before_numeric_drop = len(df)
     df = df.dropna(
-        subset=[
-            "timestamp",
-            "amount",
-            "oldbalanceOrg",
-            "newbalanceOrig",
-            "oldbalanceDest",
-            "newbalanceDest",
-            "is_fraud",
-        ]
+        subset=["amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest", "is_fraud"]
     )
-    conversion_dropped = before_type_drop - len(df)
+    invalid_numeric_rows_dropped = before_numeric_drop - len(df)
 
     # Deduplicate by transaction_id
     before_dedupe = len(df)
@@ -87,6 +140,11 @@ def main() -> None:
     duplicates_removed = before_dedupe - len(df)
 
     # Force final dtypes
+    df["amount"] = df["amount"].astype(float)
+    df["oldbalanceOrg"] = df["oldbalanceOrg"].astype(float)
+    df["newbalanceOrig"] = df["newbalanceOrig"].astype(float)
+    df["oldbalanceDest"] = df["oldbalanceDest"].astype(float)
+    df["newbalanceDest"] = df["newbalanceDest"].astype(float)
     df["is_fraud"] = df["is_fraud"].astype(int)
 
     # Schema validation (required columns)
@@ -113,7 +171,8 @@ def main() -> None:
 
     print(f"Rows read: {total_rows:,}")
     print(f"Malformed rows skipped: {malformed_rows:,}")
-    print(f"Rows dropped after type conversion: {conversion_dropped:,}")
+    print(f"Invalid timestamps dropped: {invalid_timestamps_dropped:,}")
+    print(f"Invalid numeric rows dropped: {invalid_numeric_rows_dropped:,}")
     print(f"Duplicates removed: {duplicates_removed:,}")
     print(f"Final clean rows: {len(df):,}")
     print(f"Output path: {OUTPUT_PARQUET_PATH}")
